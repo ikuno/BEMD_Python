@@ -2,18 +2,24 @@
 
 ## 言語
 
-- TypeScript 5.3+
-- Node.js 20+
+- Python 3.12+
 
-## フレームワーク
+## ライブラリ
 
-- [使用するフレームワーク]
+- numpy 2.4+ (配列演算)
+- scipy 1.17+ (疎行列・LSQR ソルバー)
+- matplotlib 3.10+ (可視化)
+- Pillow 12+ (画像入出力)
 
 ## ツール
 
-- Vitest (テスト)
-- ESLint (リント)
+- pytest 9+ (テスト)
+- conda (仮想環境管理: `conda activate bemd`)
+
+## 移植元
+
+- MATLAB `bemd.m` (extrema, extrema2, gridfit を含む)
 
 ---
 
-**生成日**: 2026-03-03
+**更新日**: 2026-03-03
