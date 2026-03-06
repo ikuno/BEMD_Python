@@ -4,7 +4,7 @@
 
 import numpy as np
 from scipy import sparse
-from scipy.sparse.linalg import lsqr
+from scipy.sparse.linalg import spsolve
 
 
 def gridfit(x, y, z, xnodes, ynodes, smoothness=1.0):
@@ -61,7 +61,6 @@ def gridfit(x, y, z, xnodes, ynodes, smoothness=1.0):
     indy = np.clip(indy, 0, ny - 2)
 
     # Linear index: column-major storage matching MATLAB convention
-    # ind = indy + ny * indx
     ind = indy + ny * indx
 
     # Normalized coordinates within each cell
@@ -76,7 +75,7 @@ def gridfit(x, y, z, xnodes, ynodes, smoothness=1.0):
     t1 = np.minimum(tx, ty)
     t2 = np.maximum(tx, ty)
 
-    row_idx = np.repeat(np.arange(n), 3)
+    row_idx = np.tile(np.arange(n), 3)
     col_idx = np.concatenate([ind, ind + ny + 1, ind + L])
     values = np.concatenate([1 - t2, t1, t2 - t1])
 
@@ -96,7 +95,7 @@ def gridfit(x, y, z, xnodes, ynodes, smoothness=1.0):
         dy2 = dy[j_y] / yscale
         m_y = len(ind_y)
 
-        row_y = np.repeat(np.arange(m_y), 3)
+        row_y = np.tile(np.arange(m_y), 3)
         col_y = np.concatenate([ind_y - 1, ind_y, ind_y + 1])
         val_y = np.concatenate([
             -2.0 / (dy1 * (dy1 + dy2)),
@@ -115,7 +114,7 @@ def gridfit(x, y, z, xnodes, ynodes, smoothness=1.0):
         dx2 = dx[i_x] / xscale
         m_x = len(ind_x)
 
-        row_x = np.repeat(np.arange(m_x), 3)
+        row_x = np.tile(np.arange(m_x), 3)
         col_x = np.concatenate([ind_x - ny, ind_x, ind_x + ny])
         val_x = np.concatenate([
             -2.0 / (dx1 * (dx1 + dx2)),
@@ -142,11 +141,13 @@ def gridfit(x, y, z, xnodes, ynodes, smoothness=1.0):
         A_full = A
         rhs_full = rhs
 
-    # Solve using LSQR (more robust than normal equations for potentially
-    # rank-deficient systems)
-    result = lsqr(A_full, rhs_full, atol=1e-12, btol=1e-12,
-                  iter_lim=max(10000, ngrid))
-    zgrid_flat = result[0]
+    # Solve via normal equations (A'*A)\(A'*rhs) using direct sparse solver
+    # This matches MATLAB gridfit's 'backslash' solver for overdetermined systems
+    # Add small Tikhonov regularization for numerical stability
+    A_full_csc = A_full.tocsc()
+    AtA = A_full_csc.T @ A_full_csc + 1e-10 * sparse.eye(ngrid, format='csc')
+    Atrhs = A_full_csc.T @ rhs_full
+    zgrid_flat = spsolve(AtA, Atrhs)
 
     # Reshape: the linear index is ind = iy + ny*ix,
     # so zgrid_flat stores nx columns of ny elements each.

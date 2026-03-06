@@ -75,13 +75,17 @@ def extrema2(xy):
         # Check peaks on down-up diagonal
         sextmax, sextmin = _extremos_diag(iext, jext, xy, 1)
 
-        # Include corner points
+        # Include corner points matching MATLAB: [M; N*M-M] in column-major 1-based
+        # M -> (M,1) in 1-based = (M-1,0) in 0-based -> row-major: (M-1)*N
+        # N*M-M -> (M,N-1) in 1-based = (M-1,N-2) in 0-based -> row-major: (M-1)*N+(N-2)
         corners1 = np.array([np.ravel_multi_index((M - 1, 0), (M, N)),
-                             np.ravel_multi_index((0, N - 1), (M, N))])
+                             np.ravel_multi_index((M - 1, N - 2), (M, N))])
         smax = np.intersect1d(smax, np.union1d(corners1, sextmax))
         smin = np.intersect1d(smin, np.union1d(corners1, sextmin))
 
         # Peaks on up-down diagonals
+        # MATLAB: [1; N*M] in column-major 1-based = (1,1) and (M,N)
+        # -> (0,0) and (M-1,N-1) in 0-based -> row-major: 0 and M*N-1
         all_extrema2 = np.union1d(smax, smin)
         if len(all_extrema2) > 0:
             iext2, jext2 = np.unravel_index(all_extrema2, (M, N))
