@@ -1,5 +1,6 @@
 # REQ-BEMD-003: 2D extrema detection
 # Ported from MATLAB extrema2.m by Carlos Adrian Vargas Aguilera
+# Vectorized implementation for performance
 
 import numpy as np
 from bemd.extrema import extrema
@@ -118,26 +119,94 @@ def extrema2(xy):
 
 
 def _extremos(matriz):
-    """Find peaks through columns (or rows if transposed input).
+    """Find peaks through columns using vectorized operations.
+
+    Processes all columns at once instead of looping with 1D extrema().
 
     Args:
-        matriz: 2D numpy array.
+        matriz: 2D numpy array (Rows x Cols).
 
     Returns:
         tuple: (smax, smin) - arrays of (row, col) index pairs.
     """
+    Rows, Cols = matriz.shape
+
+    if Rows < 2:
+        return np.empty((0, 2), dtype=int), np.empty((0, 2), dtype=int)
+
+    # Compute differences along rows (axis=0) for all columns at once
+    dx = np.diff(matriz, axis=0)  # (Rows-1, Cols)
+
+    # Find non-zero diff positions
+    nonzero = dx != 0  # (Rows-1, Cols)
+
+    # Check if any column has all-zero diffs (constant signal)
+    any_nonzero = np.any(nonzero, axis=0)  # (Cols,)
+
     smax_list = []
     smin_list = []
 
-    for n in range(matriz.shape[1]):
-        col = matriz[:, n]
-        _, imaxfil, _, iminfil = extrema(col)
-        if len(imaxfil) > 0:
-            imaxcol = np.full(len(imaxfil), n)
-            smax_list.append(np.column_stack([imaxfil, imaxcol]))
-        if len(iminfil) > 0:
-            imincol = np.full(len(iminfil), n)
-            smin_list.append(np.column_stack([iminfil, imincol]))
+    # Process columns that have variation
+    active_cols = np.where(any_nonzero)[0]
+
+    if len(active_cols) == 0:
+        return np.empty((0, 2), dtype=int), np.empty((0, 2), dtype=int)
+
+    for n in active_cols:
+        col_dx = dx[:, n]
+
+        # Find non-zero diff indices
+        a = np.where(col_dx != 0)[0]
+        if len(a) == 0:
+            continue
+
+        # Handle flat peaks: place at midpoint
+        lm = np.where(np.diff(a) != 1)[0] + 1
+        if len(lm) > 0:
+            d = a[lm] - a[lm - 1]
+            a[lm] = a[lm] - d // 2
+        a = np.append(a, Rows - 1)
+
+        # Peak detection via sign changes
+        xa = matriz[a, n]
+        b = (np.diff(xa) > 0).astype(int)
+        xb = np.diff(b)
+        imax_local = a[np.where(xb == -1)[0] + 1]
+        imin_local = a[np.where(xb == 1)[0] + 1]
+
+        nmaxi = len(imax_local)
+        nmini = len(imin_local)
+
+        # Handle edge cases (same logic as MATLAB extrema)
+        if nmaxi == 0 and nmini == 0:
+            if matriz[0, n] > matriz[Rows - 1, n]:
+                imax_local = np.array([0])
+                imin_local = np.array([Rows - 1])
+            elif matriz[0, n] < matriz[Rows - 1, n]:
+                imax_local = np.array([Rows - 1])
+                imin_local = np.array([0])
+            else:
+                continue
+        elif nmaxi == 0:
+            imax_local = np.array([0, Rows - 1])
+        elif nmini == 0:
+            imin_local = np.array([0, Rows - 1])
+        else:
+            if imax_local[0] < imin_local[0]:
+                imin_local = np.concatenate(([0], imin_local))
+            else:
+                imax_local = np.concatenate(([0], imax_local))
+            if imax_local[-1] > imin_local[-1]:
+                imin_local = np.append(imin_local, Rows - 1)
+            else:
+                imax_local = np.append(imax_local, Rows - 1)
+
+        if len(imax_local) > 0:
+            smax_list.append(np.column_stack([imax_local,
+                                              np.full(len(imax_local), n)]))
+        if len(imin_local) > 0:
+            smin_list.append(np.column_stack([imin_local,
+                                              np.full(len(imin_local), n)]))
 
     if smax_list:
         smax = np.vstack(smax_list)

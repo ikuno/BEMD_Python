@@ -1,42 +1,26 @@
-# REQ-BEMD-004: Surface fitting from scattered data
-# Python implementation of gridfit using scipy sparse + regularization
+# REQ-BEMD-004: Surface fitting from scattered data (GPU variant)
+# Python implementation of gridfit using CuPy (GPU-accelerated)
 # Original MATLAB gridfit by John D'Errico
+#
+# This variant offloads the normal equations solve to the GPU using
+# CuPy's sparse CG solver. Intended for comparison benchmarks.
 
 import numpy as np
-from scipy import sparse
-from scipy.sparse.linalg import spsolve
+from scipy import sparse as sp_sparse
 
-try:
-    from sksparse.cholmod import cholesky as cholmod_cholesky
-    _HAS_CHOLMOD = True
-except ImportError:
-    _HAS_CHOLMOD = False
+import cupy as cp
+import cupyx.scipy.sparse as cp_sparse
+from cupyx.scipy.sparse.linalg import cg as cp_cg, LinearOperator as CpLinearOperator
 
 
-def gridfit(x, y, z, xnodes, ynodes, smoothness=1.0):
-    """Estimates a surface on a 2D grid from scattered data.
-
-    Uses a regularized least-squares approach with gradient smoothing.
-    This is a simplified Python port of MATLAB gridfit by John D'Errico.
-
-    Args:
-        x: 1D array of x coordinates of scattered data.
-        y: 1D array of y coordinates of scattered data.
-        z: 1D array of z values at (x, y) points.
-        xnodes: 1D array defining grid nodes in x direction.
-        ynodes: 1D array defining grid nodes in y direction.
-        smoothness: Smoothing parameter (default 1.0). Larger = smoother.
-
-    Returns:
-        zgrid: 2D array (len(ynodes) x len(xnodes)) containing the fitted surface.
-    """
+def _build_system_cpu(x, y, z, xnodes, ynodes, smoothness):
+    """Build the interpolation + regularization system on CPU (reuses gridfit logic)."""
     x = np.asarray(x, dtype=float).ravel()
     y = np.asarray(y, dtype=float).ravel()
     z = np.asarray(z, dtype=float).ravel()
     xnodes = np.asarray(xnodes, dtype=float).copy().ravel()
     ynodes = np.asarray(ynodes, dtype=float).copy().ravel()
 
-    # Remove NaN data
     valid = ~(np.isnan(x) | np.isnan(y) | np.isnan(z))
     x, y, z = x[valid], y[valid], z[valid]
 
@@ -44,7 +28,6 @@ def gridfit(x, y, z, xnodes, ynodes, smoothness=1.0):
     if n < 3:
         raise ValueError("Insufficient data for surface estimation.")
 
-    # Extend nodes to cover data range
     xnodes[0] = min(xnodes[0], x.min())
     xnodes[-1] = max(xnodes[-1], x.max())
     ynodes[0] = min(ynodes[0], y.min())
@@ -56,24 +39,19 @@ def gridfit(x, y, z, xnodes, ynodes, smoothness=1.0):
     ny = len(ynodes)
     ngrid = nx * ny
 
-    # Autoscale
     xscale = np.mean(dx)
     yscale = np.mean(dy)
 
-    # Determine which cell each point lies in
     indx = np.searchsorted(xnodes, x, side='right') - 1
     indy = np.searchsorted(ynodes, y, side='right') - 1
     indx = np.clip(indx, 0, nx - 2)
     indy = np.clip(indy, 0, ny - 2)
 
-    # Linear index: column-major storage matching MATLAB convention
     ind = indy + ny * indx
 
-    # Normalized coordinates within each cell
     tx = np.clip((x - xnodes[indx]) / dx[indx], 0, 1)
     ty = np.clip((y - ynodes[indy]) / dy[indy], 0, 1)
 
-    # Triangle interpolation
     k = tx > ty
     L = np.ones(n, dtype=int)
     L[k] = ny
@@ -85,13 +63,11 @@ def gridfit(x, y, z, xnodes, ynodes, smoothness=1.0):
     col_idx = np.concatenate([ind, ind + ny + 1, ind + L])
     values = np.concatenate([1 - t2, t1, t2 - t1])
 
-    A = sparse.csr_matrix((values, (row_idx, col_idx)), shape=(n, ngrid))
+    A = sp_sparse.csr_matrix((values, (row_idx, col_idx)), shape=(n, ngrid))
     rhs = z.copy()
 
-    # Build gradient regularizer
     reg_parts = []
 
-    # Y-direction (along ynodes, i.e., interior y-nodes for all x-nodes)
     if ny > 2:
         i_y, j_y = np.meshgrid(np.arange(nx), np.arange(1, ny - 1), indexing='ij')
         i_y = i_y.ravel()
@@ -108,9 +84,8 @@ def gridfit(x, y, z, xnodes, ynodes, smoothness=1.0):
             2.0 / (dy1 * dy2),
             -2.0 / (dy2 * (dy1 + dy2))
         ])
-        reg_parts.append(sparse.csr_matrix((val_y, (row_y, col_y)), shape=(m_y, ngrid)))
+        reg_parts.append(sp_sparse.csr_matrix((val_y, (row_y, col_y)), shape=(m_y, ngrid)))
 
-    # X-direction (along xnodes, i.e., interior x-nodes for all y-nodes)
     if nx > 2:
         i_x, j_x = np.meshgrid(np.arange(1, nx - 1), np.arange(ny), indexing='ij')
         i_x = i_x.ravel()
@@ -127,42 +102,76 @@ def gridfit(x, y, z, xnodes, ynodes, smoothness=1.0):
             2.0 / (dx1 * dx2),
             -2.0 / (dx2 * (dx1 + dx2))
         ])
-        reg_parts.append(sparse.csr_matrix((val_x, (row_x, col_x)), shape=(m_x, ngrid)))
+        reg_parts.append(sp_sparse.csr_matrix((val_x, (row_x, col_x)), shape=(m_x, ngrid)))
 
     if reg_parts:
-        Areg = sparse.vstack(reg_parts)
+        Areg = sp_sparse.vstack(reg_parts)
         nreg = Areg.shape[0]
 
-        # Scale regularizer relative to interpolation equations
-        NA = sparse.linalg.norm(A, ord=1)
-        NR = sparse.linalg.norm(Areg, ord=1)
+        NA = sp_sparse.linalg.norm(A, ord=1)
+        NR = sp_sparse.linalg.norm(Areg, ord=1)
         if NR > 0:
             scale = smoothness * NA / NR
         else:
             scale = smoothness
 
-        A_full = sparse.vstack([A, Areg * scale])
+        A_full = sp_sparse.vstack([A, Areg * scale])
         rhs_full = np.concatenate([rhs, np.zeros(nreg)])
     else:
         A_full = A
         rhs_full = rhs
 
-    # Solve via normal equations (A'*A)\(A'*rhs)
-    # Add small Tikhonov regularization for numerical stability
     A_full_csc = A_full.tocsc()
-    AtA = (A_full_csc.T @ A_full_csc + 1e-10 * sparse.eye(ngrid, format='csc')).tocsc()
+    AtA = (A_full_csc.T @ A_full_csc + 1e-10 * sp_sparse.eye(ngrid, format='csc')).tocsc()
     Atrhs = A_full_csc.T @ rhs_full
 
-    # Use cholmod (Cholesky factorization) if available, otherwise spsolve
-    if _HAS_CHOLMOD:
-        factor = cholmod_cholesky(AtA)
-        zgrid_flat = factor(Atrhs)
-    else:
-        zgrid_flat = spsolve(AtA, Atrhs)
+    return AtA, Atrhs, nx, ny
 
-    # Reshape: the linear index is ind = iy + ny*ix,
-    # so zgrid_flat stores nx columns of ny elements each.
-    # reshape(nx, ny) gives [ix, iy], transpose gives [iy, ix] = (ny, nx)
+
+def gridfit_gpu(x, y, z, xnodes, ynodes, smoothness=1.0, tol=1e-8,
+                maxiter=None):
+    """Estimates a surface on a 2D grid from scattered data using GPU CG solver.
+
+    Builds the system on CPU, transfers to GPU, solves with CuPy's CG solver.
+
+    Args:
+        x: 1D array of x coordinates of scattered data.
+        y: 1D array of y coordinates of scattered data.
+        z: 1D array of z values at (x, y) points.
+        xnodes: 1D array defining grid nodes in x direction.
+        ynodes: 1D array defining grid nodes in y direction.
+        smoothness: Smoothing parameter (default 1.0). Larger = smoother.
+        tol: Convergence tolerance for CG solver (default 1e-8).
+        maxiter: Maximum CG iterations (default: ngrid).
+
+    Returns:
+        zgrid: 2D numpy array (len(ynodes) x len(xnodes)) containing the fitted surface.
+    """
+    # Build system on CPU
+    AtA, Atrhs, nx, ny = _build_system_cpu(x, y, z, xnodes, ynodes, smoothness)
+    ngrid = nx * ny
+
+    if maxiter is None:
+        maxiter = ngrid
+
+    # Transfer to GPU
+    AtA_gpu = cp_sparse.csc_matrix(AtA)
+    Atrhs_gpu = cp.asarray(Atrhs)
+
+    # Jacobi (diagonal) preconditioner on GPU
+    diag = cp.array(AtA.diagonal())
+    diag_inv = cp.where(cp.abs(diag) > 1e-14, 1.0 / diag, 1.0)
+    M = CpLinearOperator((ngrid, ngrid), matvec=lambda v: diag_inv * v)
+
+    # Solve with GPU CG
+    zgrid_flat_gpu, info = cp_cg(AtA_gpu, Atrhs_gpu, rtol=tol, maxiter=maxiter, M=M)
+
+    if info > 0:
+        import warnings
+        warnings.warn(f"GPU CG did not converge within {maxiter} iterations (info={info}).")
+
+    # Transfer back to CPU
+    zgrid_flat = cp.asnumpy(zgrid_flat_gpu)
     zgrid = zgrid_flat.reshape(nx, ny).T
 
     return zgrid
